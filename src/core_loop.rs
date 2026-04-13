@@ -17,6 +17,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use anyhow::Result;
@@ -26,6 +27,7 @@ use onsager::factory_event::{
 use onsager::{ArtifactId, EventMetadata, EventStore};
 
 use crate::artifact_store::ArtifactStore;
+use crate::clients::{StiglabClient, SynodicClient};
 use crate::config::ForgeConfig;
 use crate::kernel::{BaselineKernel, SchedulingKernel};
 
@@ -57,6 +59,8 @@ pub struct ForgeLoop {
     kernel: Arc<Mutex<BaselineKernel>>,
     state: Arc<Mutex<ProcessState>>,
     in_flight: Arc<Mutex<HashSet<ArtifactId>>>,
+    stiglab: StiglabClient,
+    synodic: SynodicClient,
 }
 
 impl ForgeLoop {
@@ -65,6 +69,12 @@ impl ForgeLoop {
         let event_store = EventStore::connect(&config.database_url).await?;
         let artifact_store = ArtifactStore::new(event_store.pool().clone());
 
+        let stiglab = StiglabClient::new(
+            &config.stiglab_url,
+            Duration::from_secs(config.shaping_timeout_secs),
+        );
+        let synodic = SynodicClient::new(&config.synodic_url);
+
         Ok(Self {
             config: config.clone(),
             event_store,
@@ -72,6 +82,8 @@ impl ForgeLoop {
             kernel: Arc::new(Mutex::new(BaselineKernel::new())),
             state: Arc::new(Mutex::new(ProcessState::Running)),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
+            stiglab,
+            synodic,
         })
     }
 
@@ -167,23 +179,73 @@ impl ForgeLoop {
                             })
                             .await?;
 
-                            // TODO: Pre-dispatch gate (Forge → Synodic).
-                            // For v0.1 baseline, we emit the gate event but
-                            // auto-allow until Synodic is connected.
+                            // Pre-dispatch gate (Forge -> Synodic)
+                            let gate_req = onsager::protocol::GateRequest {
+                                context: onsager::protocol::GateContext {
+                                    gate_point: GatePoint::PreDispatch,
+                                    artifact_id: decision.artifact_id.clone(),
+                                    artifact_kind: onsager::Kind::Code, // TODO: look up from artifact
+                                    current_state: onsager::ArtifactState::InProgress,
+                                    target_state: Some(decision.target_state),
+                                    extra: None,
+                                },
+                                proposed_action: onsager::protocol::ProposedAction {
+                                    description: format!(
+                                        "Shape {} v{}",
+                                        decision.artifact_id, decision.target_version
+                                    ),
+                                    payload: decision.shaping_intent.clone(),
+                                },
+                            };
+
                             self.emit_event(FactoryEventKind::ForgeGateRequested {
                                 artifact_id: decision.artifact_id.clone(),
                                 gate_point: GatePoint::PreDispatch,
                             })
                             .await?;
 
+                            let verdict = match self.synodic.gate(&gate_req).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "synodic gate call failed, auto-allowing");
+                                    onsager::GateVerdict::Allow
+                                }
+                            };
+
+                            let verdict_summary = match &verdict {
+                                onsager::GateVerdict::Allow => VerdictSummary::Allow,
+                                onsager::GateVerdict::Deny { .. } => VerdictSummary::Deny,
+                                onsager::GateVerdict::Modify { .. } => VerdictSummary::Modify,
+                                onsager::GateVerdict::Escalate { .. } => VerdictSummary::Escalate,
+                            };
+
                             self.emit_event(FactoryEventKind::ForgeGateVerdict {
                                 artifact_id: decision.artifact_id.clone(),
                                 gate_point: GatePoint::PreDispatch,
-                                verdict: VerdictSummary::Allow,
+                                verdict: verdict_summary,
                             })
                             .await?;
 
-                            // Track in-flight.
+                            match &verdict {
+                                onsager::GateVerdict::Deny { reason } => {
+                                    tracing::warn!(
+                                        artifact_id = decision.artifact_id.as_str(),
+                                        reason = %reason,
+                                        "pre-dispatch gate denied"
+                                    );
+                                    continue;
+                                }
+                                onsager::GateVerdict::Allow => {} // proceed
+                                _ => {
+                                    tracing::warn!(
+                                        artifact_id = decision.artifact_id.as_str(),
+                                        "gate returned modify/escalate, treating as deny for MVP"
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            // Track in-flight
                             self.in_flight
                                 .lock()
                                 .await
@@ -191,7 +253,6 @@ impl ForgeLoop {
 
                             let request_id = uuid::Uuid::new_v4().to_string();
 
-                            // Emit dispatch event.
                             self.emit_event(FactoryEventKind::ForgeShapingDispatched {
                                 request_id: request_id.clone(),
                                 artifact_id: decision.artifact_id.clone(),
@@ -199,29 +260,102 @@ impl ForgeLoop {
                             })
                             .await?;
 
-                            // Observe the dispatch in the kernel.
+                            // Build ShapingRequest
+                            let shaping_req = onsager::ShapingRequest {
+                                request_id: request_id.clone(),
+                                artifact_id: decision.artifact_id.clone(),
+                                target_version: decision.target_version,
+                                shaping_intent: decision.shaping_intent.clone(),
+                                inputs: decision.inputs.clone(),
+                                constraints: decision.constraints.clone(),
+                                deadline: decision.deadline,
+                            };
+
+                            // Observe dispatch in kernel
                             self.kernel.lock().await.observe(
                                 &FactoryEventKind::ForgeShapingDispatched {
-                                    request_id,
+                                    request_id: request_id.clone(),
                                     artifact_id: decision.artifact_id.clone(),
                                     target_version: decision.target_version,
                                 },
                             );
 
-                            // TODO: Actual Stiglab dispatch over the network.
-                            // For now, log and remove from in-flight
-                            // (Stiglab integration comes next).
-                            tracing::info!(
-                                artifact_id = decision.artifact_id.as_str(),
-                                "dispatched to Stiglab (stub — awaiting Stiglab integration)"
-                            );
+                            // Dispatch to Stiglab
+                            let shaping_result = self.stiglab.dispatch_shaping(&shaping_req).await;
 
-                            self.emit_event(FactoryEventKind::ForgeShapingReturned {
-                                request_id: uuid::Uuid::new_v4().to_string(),
-                                artifact_id: decision.artifact_id.clone(),
-                                outcome: ShapingOutcome::Completed,
-                            })
-                            .await?;
+                            match shaping_result {
+                                Ok(result) => {
+                                    tracing::info!(
+                                        artifact_id = decision.artifact_id.as_str(),
+                                        outcome = ?result.outcome,
+                                        duration_ms = result.duration_ms,
+                                        "shaping completed"
+                                    );
+
+                                    self.emit_event(FactoryEventKind::ForgeShapingReturned {
+                                        request_id: result.request_id.clone(),
+                                        artifact_id: decision.artifact_id.clone(),
+                                        outcome: result.outcome,
+                                    })
+                                    .await?;
+
+                                    if result.outcome == ShapingOutcome::Completed {
+                                        // Create version
+                                        if let Some(ref content_ref) = result.content_ref {
+                                            self.artifact_store
+                                                .create_version(
+                                                    &decision.artifact_id,
+                                                    decision.target_version,
+                                                    &content_ref.uri,
+                                                    content_ref.checksum.as_deref(),
+                                                    &result.change_summary,
+                                                    &result.session_id,
+                                                )
+                                                .await?;
+
+                                            self.emit_event(
+                                                FactoryEventKind::ArtifactVersionCreated {
+                                                    artifact_id: decision.artifact_id.clone(),
+                                                    version: decision.target_version,
+                                                    content_ref_uri: content_ref.uri.clone(),
+                                                    change_summary: result.change_summary.clone(),
+                                                    session_id: result.session_id.clone(),
+                                                },
+                                            )
+                                            .await?;
+                                        }
+
+                                        // Advance state
+                                        let from_state = self
+                                            .artifact_store
+                                            .advance_state(
+                                                &decision.artifact_id,
+                                                decision.target_state,
+                                            )
+                                            .await?;
+
+                                        self.emit_event(FactoryEventKind::ArtifactStateChanged {
+                                            artifact_id: decision.artifact_id.clone(),
+                                            from_state,
+                                            to_state: decision.target_state,
+                                        })
+                                        .await?;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        artifact_id = decision.artifact_id.as_str(),
+                                        error = %e,
+                                        "stiglab dispatch failed"
+                                    );
+                                    self.emit_event(FactoryEventKind::ForgeShapingReturned {
+                                        request_id,
+                                        artifact_id: decision.artifact_id.clone(),
+                                        outcome: ShapingOutcome::Failed,
+                                    })
+                                    .await?;
+                                }
+                            }
 
                             self.in_flight.lock().await.remove(&decision.artifact_id);
                         }

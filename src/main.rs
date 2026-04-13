@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 mod artifact_store;
+mod clients;
 mod config;
 mod core_loop;
 mod kernel;

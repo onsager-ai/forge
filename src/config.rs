@@ -14,6 +14,12 @@ pub struct ForgeConfig {
     pub idle_event_interval: Duration,
     /// Maximum concurrent in-flight shaping requests.
     pub max_in_flight: usize,
+    /// Base URL for Stiglab (e.g., "http://localhost:3000").
+    pub stiglab_url: String,
+    /// Base URL for Synodic (e.g., "http://localhost:3001").
+    pub synodic_url: String,
+    /// Timeout for shaping requests to Stiglab, in seconds.
+    pub shaping_timeout_secs: u64,
 }
 
 impl ForgeConfig {
@@ -36,11 +42,25 @@ impl ForgeConfig {
             .parse()
             .context("FORGE_MAX_IN_FLIGHT must be a number")?;
 
+        let stiglab_url =
+            std::env::var("STIGLAB_URL").unwrap_or_else(|_| "http://localhost:3000".into());
+
+        let synodic_url =
+            std::env::var("SYNODIC_URL").unwrap_or_else(|_| "http://localhost:3001".into());
+
+        let shaping_timeout_secs: u64 = std::env::var("FORGE_SHAPING_TIMEOUT_SECS")
+            .unwrap_or_else(|_| "300".into())
+            .parse()
+            .context("FORGE_SHAPING_TIMEOUT_SECS must be a number")?;
+
         Ok(Self {
             database_url,
             idle_tick_interval: Duration::from_millis(idle_tick_ms),
             idle_event_interval: Duration::from_millis(idle_event_ms),
             max_in_flight,
+            stiglab_url,
+            synodic_url,
+            shaping_timeout_secs,
         })
     }
 
