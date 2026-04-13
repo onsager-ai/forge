@@ -30,6 +30,7 @@ use crate::artifact_store::ArtifactStore;
 use crate::clients::{StiglabClient, SynodicClient};
 use crate::config::ForgeConfig;
 use crate::kernel::{BaselineKernel, SchedulingKernel};
+use crate::router::{ConsumerSink, LogSink};
 
 /// Forge process state (forge-v0.1 §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +62,7 @@ pub struct ForgeLoop {
     in_flight: Arc<Mutex<HashSet<ArtifactId>>>,
     stiglab: StiglabClient,
     synodic: SynodicClient,
+    sinks: Vec<Arc<dyn ConsumerSink>>,
 }
 
 impl ForgeLoop {
@@ -84,6 +86,7 @@ impl ForgeLoop {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             stiglab,
             synodic,
+            sinks: vec![Arc::new(LogSink)],
         })
     }
 
@@ -340,6 +343,16 @@ impl ForgeLoop {
                                             to_state: decision.target_state,
                                         })
                                         .await?;
+
+                                        // Route released artifacts to consumers.
+                                        if decision.target_state == onsager::ArtifactState::Released
+                                        {
+                                            self.route_artifact(
+                                                &decision.artifact_id,
+                                                decision.target_version,
+                                            )
+                                            .await?;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -368,6 +381,84 @@ impl ForgeLoop {
     }
 
     // -- Helpers -------------------------------------------------------------
+
+    /// Gate the consumer routing step with Synodic, then dispatch to all sinks.
+    async fn route_artifact(&self, artifact_id: &ArtifactId, version: u32) -> Result<()> {
+        let gate_req = onsager::protocol::GateRequest {
+            context: onsager::protocol::GateContext {
+                gate_point: GatePoint::ConsumerRouting,
+                artifact_id: artifact_id.clone(),
+                artifact_kind: onsager::Kind::Code, // TODO: look up from artifact
+                current_state: onsager::ArtifactState::Released,
+                target_state: None,
+                extra: None,
+            },
+            proposed_action: onsager::protocol::ProposedAction {
+                description: format!("Route artifact {} v{} to consumers", artifact_id, version),
+                payload: serde_json::Value::Null,
+            },
+        };
+
+        self.emit_event(FactoryEventKind::ForgeGateRequested {
+            artifact_id: artifact_id.clone(),
+            gate_point: GatePoint::ConsumerRouting,
+        })
+        .await?;
+
+        let verdict = match self.synodic.gate(&gate_req).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "synodic consumer-routing gate failed, auto-allowing");
+                onsager::GateVerdict::Allow
+            }
+        };
+
+        let verdict_summary = match &verdict {
+            onsager::GateVerdict::Allow => VerdictSummary::Allow,
+            onsager::GateVerdict::Deny { .. } => VerdictSummary::Deny,
+            onsager::GateVerdict::Modify { .. } => VerdictSummary::Modify,
+            onsager::GateVerdict::Escalate { .. } => VerdictSummary::Escalate,
+        };
+
+        self.emit_event(FactoryEventKind::ForgeGateVerdict {
+            artifact_id: artifact_id.clone(),
+            gate_point: GatePoint::ConsumerRouting,
+            verdict: verdict_summary,
+        })
+        .await?;
+
+        if !matches!(verdict, onsager::GateVerdict::Allow) {
+            tracing::warn!(
+                artifact_id = artifact_id.as_str(),
+                "consumer routing gate denied, skipping sinks"
+            );
+            return Ok(());
+        }
+
+        // Dispatch to each registered sink (at-least-once; sinks must be idempotent).
+        for sink in &self.sinks {
+            match sink.route(artifact_id, version).await {
+                Ok(()) => {
+                    self.emit_event(FactoryEventKind::ArtifactRouted {
+                        artifact_id: artifact_id.clone(),
+                        consumer_id: sink.name().to_string(),
+                        sink: sink.name().to_string(),
+                    })
+                    .await?;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        artifact_id = artifact_id.as_str(),
+                        sink = sink.name(),
+                        error = %e,
+                        "consumer sink routing failed"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 
     async fn emit_event(&self, event: FactoryEventKind) -> Result<()> {
         let data = serde_json::to_value(&event)?;
