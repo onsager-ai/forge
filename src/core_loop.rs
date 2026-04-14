@@ -15,7 +15,7 @@
 //!
 //! See `specs/forge-v0.1.md §3` for the full specification.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -24,6 +24,7 @@ use anyhow::Result;
 use onsager::factory_event::{
     FactoryEventKind, ForgeProcessState, GatePoint, ShapingOutcome, VerdictSummary,
 };
+use onsager::protocol::EscalationContext;
 use onsager::{ArtifactId, EventMetadata, EventStore};
 
 use crate::artifact_store::ArtifactStore;
@@ -60,6 +61,9 @@ pub struct ForgeLoop {
     kernel: Arc<Mutex<BaselineKernel>>,
     state: Arc<Mutex<ProcessState>>,
     in_flight: Arc<Mutex<HashSet<ArtifactId>>>,
+    /// Artifacts parked waiting for an escalation verdict.
+    /// Key: escalation_id (from Synodic); Value: artifact_id.
+    escalated: Arc<Mutex<HashMap<String, ArtifactId>>>,
     stiglab: StiglabClient,
     synodic: SynodicClient,
     sinks: Vec<Arc<dyn ConsumerSink>>,
@@ -84,6 +88,7 @@ impl ForgeLoop {
             kernel: Arc::new(Mutex::new(BaselineKernel::new())),
             state: Arc::new(Mutex::new(ProcessState::Running)),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
+            escalated: Arc::new(Mutex::new(HashMap::new())),
             stiglab,
             synodic,
             sinks: vec![Arc::new(LogSink)],
@@ -96,6 +101,18 @@ impl ForgeLoop {
             .await?;
 
         tracing::info!("Forge core loop started");
+
+        // Spawn background: escalation resolver watches for synodic.escalation_resolved.
+        tokio::spawn(run_escalation_resolver(
+            self.event_store.clone(),
+            Arc::clone(&self.escalated),
+        ));
+
+        // Spawn background: Ising observer forwards insights to the kernel.
+        tokio::spawn(run_ising_observer(
+            self.event_store.clone(),
+            Arc::clone(&self.kernel),
+        ));
 
         let mut idle_event_countdown = self.config.idle_event_interval;
 
@@ -145,8 +162,12 @@ impl ForgeLoop {
                     }
 
                     // Load world state and ask kernel for a decision.
-                    let in_flight = self.in_flight.lock().await.clone();
-                    let world = self.artifact_store.load_world_state(&in_flight).await?;
+                    // Exclude both in-flight and escalated artifacts from scheduling.
+                    let mut excluded = self.in_flight.lock().await.clone();
+                    for art_id in self.escalated.lock().await.values() {
+                        excluded.insert(art_id.clone());
+                    }
+                    let world = self.artifact_store.load_world_state(&excluded).await?;
 
                     let decision = self.kernel.lock().await.decide(&world).await;
 
@@ -230,6 +251,7 @@ impl ForgeLoop {
                             .await?;
 
                             match &verdict {
+                                onsager::GateVerdict::Allow => {} // proceed
                                 onsager::GateVerdict::Deny { reason } => {
                                     tracing::warn!(
                                         artifact_id = decision.artifact_id.as_str(),
@@ -238,12 +260,15 @@ impl ForgeLoop {
                                     );
                                     continue;
                                 }
-                                onsager::GateVerdict::Allow => {} // proceed
-                                _ => {
+                                onsager::GateVerdict::Modify { .. } => {
                                     tracing::warn!(
                                         artifact_id = decision.artifact_id.as_str(),
-                                        "gate returned modify/escalate, treating as deny for MVP"
+                                        "pre-dispatch gate returned modify, treating as deny for v0.1"
                                     );
+                                    continue;
+                                }
+                                onsager::GateVerdict::Escalate { context } => {
+                                    self.park_escalation(&decision.artifact_id, context).await?;
                                     continue;
                                 }
                             }
@@ -328,6 +353,95 @@ impl ForgeLoop {
                                             .await?;
                                         }
 
+                                        // State-transition gate (Forge -> Synodic)
+                                        let st_gate_req = onsager::protocol::GateRequest {
+                                            context: onsager::protocol::GateContext {
+                                                gate_point: GatePoint::StateTransition,
+                                                artifact_id: decision.artifact_id.clone(),
+                                                artifact_kind: onsager::Kind::Code, // TODO: look up from artifact
+                                                current_state: onsager::ArtifactState::InProgress,
+                                                target_state: Some(decision.target_state),
+                                                extra: None,
+                                            },
+                                            proposed_action: onsager::protocol::ProposedAction {
+                                                description: format!(
+                                                    "Advance {} to {:?}",
+                                                    decision.artifact_id, decision.target_state
+                                                ),
+                                                payload: serde_json::Value::Null,
+                                            },
+                                        };
+
+                                        self.emit_event(FactoryEventKind::ForgeGateRequested {
+                                            artifact_id: decision.artifact_id.clone(),
+                                            gate_point: GatePoint::StateTransition,
+                                        })
+                                        .await?;
+
+                                        let st_verdict =
+                                            match self.synodic.gate(&st_gate_req).await {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "synodic state-transition gate failed, auto-allowing");
+                                                    onsager::GateVerdict::Allow
+                                                }
+                                            };
+
+                                        let st_verdict_summary = match &st_verdict {
+                                            onsager::GateVerdict::Allow => VerdictSummary::Allow,
+                                            onsager::GateVerdict::Deny { .. } => {
+                                                VerdictSummary::Deny
+                                            }
+                                            onsager::GateVerdict::Modify { .. } => {
+                                                VerdictSummary::Modify
+                                            }
+                                            onsager::GateVerdict::Escalate { .. } => {
+                                                VerdictSummary::Escalate
+                                            }
+                                        };
+
+                                        self.emit_event(FactoryEventKind::ForgeGateVerdict {
+                                            artifact_id: decision.artifact_id.clone(),
+                                            gate_point: GatePoint::StateTransition,
+                                            verdict: st_verdict_summary,
+                                        })
+                                        .await?;
+
+                                        match &st_verdict {
+                                            onsager::GateVerdict::Allow => {} // proceed
+                                            onsager::GateVerdict::Deny { reason } => {
+                                                tracing::warn!(
+                                                    artifact_id = decision.artifact_id.as_str(),
+                                                    reason = %reason,
+                                                    "state-transition gate denied"
+                                                );
+                                                self.in_flight
+                                                    .lock()
+                                                    .await
+                                                    .remove(&decision.artifact_id);
+                                                continue;
+                                            }
+                                            onsager::GateVerdict::Modify { .. } => {
+                                                tracing::warn!(
+                                                    artifact_id = decision.artifact_id.as_str(),
+                                                    "state-transition gate returned modify, treating as deny for v0.1"
+                                                );
+                                                self.in_flight
+                                                    .lock()
+                                                    .await
+                                                    .remove(&decision.artifact_id);
+                                                continue;
+                                            }
+                                            onsager::GateVerdict::Escalate { context } => {
+                                                self.park_escalation(
+                                                    &decision.artifact_id,
+                                                    context,
+                                                )
+                                                .await?;
+                                                continue;
+                                            }
+                                        }
+
                                         // Advance state
                                         let from_state = self
                                             .artifact_store
@@ -381,6 +495,31 @@ impl ForgeLoop {
     }
 
     // -- Helpers -------------------------------------------------------------
+
+    /// Park an artifact waiting for an escalation to be resolved.
+    ///
+    /// Removes the artifact from `in_flight` and records it in `escalated`
+    /// under the escalation ID returned by Synodic. The background escalation
+    /// resolver will unpark it when `synodic.escalation_resolved` arrives.
+    async fn park_escalation(
+        &self,
+        artifact_id: &ArtifactId,
+        ctx: &EscalationContext,
+    ) -> Result<()> {
+        self.in_flight.lock().await.remove(artifact_id);
+        self.escalated
+            .lock()
+            .await
+            .insert(ctx.escalation_id.clone(), artifact_id.clone());
+        tracing::info!(
+            artifact_id = artifact_id.as_str(),
+            escalation_id = %ctx.escalation_id,
+            reason = %ctx.reason,
+            target = %ctx.target,
+            "artifact parked for escalation"
+        );
+        Ok(())
+    }
 
     /// Gate the consumer routing step with Synodic, then dispatch to all sinks.
     async fn route_artifact(&self, artifact_id: &ArtifactId, version: u32) -> Result<()> {
@@ -491,5 +630,98 @@ impl ForgeLoop {
             to_state: to,
         })
         .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+/// Watch the event spine for `synodic.escalation_resolved` events and unpark
+/// the corresponding artifact from the escalated map.
+///
+/// When an escalation is resolved, Synodic appends an extension event with
+/// `stream_id = escalation_id`. This resolver removes the artifact from the
+/// parked set so the scheduling kernel will consider it again on the next tick.
+async fn run_escalation_resolver(
+    event_store: EventStore,
+    escalated: Arc<Mutex<HashMap<String, ArtifactId>>>,
+) {
+    loop {
+        let mut rx = match event_store.subscribe_bounded(256).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "escalation resolver: pg_notify subscribe failed; retrying in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        tracing::info!("escalation resolver: subscribed to pg_notify");
+
+        while let Some(notification) = rx.recv().await {
+            if notification.event_type != "synodic.escalation_resolved" {
+                continue;
+            }
+            // stream_id on events_ext is set to the escalation_id by Synodic.
+            let escalation_id = &notification.stream_id;
+            let removed = escalated.lock().await.remove(escalation_id);
+            match removed {
+                Some(artifact_id) => {
+                    tracing::info!(
+                        escalation_id = %escalation_id,
+                        artifact_id = artifact_id.as_str(),
+                        "escalation resolved; artifact unparked"
+                    );
+                }
+                None => {
+                    tracing::debug!(
+                        escalation_id = %escalation_id,
+                        "received escalation_resolved for unknown escalation (already unparked?)"
+                    );
+                }
+            }
+        }
+
+        tracing::warn!("escalation resolver: pg_notify channel closed; reconnecting");
+    }
+}
+
+/// Watch the event spine for `ising.insight_detected` events and forward them
+/// to the scheduling kernel as advisory observations.
+///
+/// In v0.1 this logs the event type; full forwarding requires a DB fetch to
+/// reconstruct the `FactoryEventKind` payload from the spine record.
+async fn run_ising_observer(
+    event_store: EventStore,
+    kernel: Arc<Mutex<BaselineKernel>>,
+) {
+    loop {
+        let mut rx = match event_store.subscribe_bounded(256).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "ising observer: pg_notify subscribe failed; retrying in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        tracing::info!("ising observer: subscribed to pg_notify");
+
+        while let Some(notification) = rx.recv().await {
+            if !notification.event_type.starts_with("ising.insight") {
+                continue;
+            }
+            tracing::info!(
+                event_type = %notification.event_type,
+                stream_id = %notification.stream_id,
+                "ising insight received (advisory only)"
+            );
+            // v0.1: log only. Full advisory forwarding requires fetching the
+            // full event record and calling kernel.lock().await.observe(&kind).
+            let _ = kernel.lock().await; // ensure kernel is accessible for future use
+        }
+
+        tracing::warn!("ising observer: pg_notify channel closed; reconnecting");
     }
 }
